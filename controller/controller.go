@@ -4,11 +4,20 @@ import (
     "context"
     "fmt"
     "path/filepath"
+    "sync"            
+    "os"              
+    "encoding/json"   
+    "net/http"        
+    "time"            
+    "bytes"          
+    "io" 
+    "gopkg.in/yaml.v2"             
 
     apiclient "github.com/argoproj/argo-cd/v2/pkg/apiclient"
-	applicationsetpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/applicationset"
-	applicationpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/application"
- 
+    applicationsetpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/applicationset"
+    applicationpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/application"
+    appv1alpha1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+    
     "go.uber.org/zap"
     "k8s.io/client-go/kubernetes"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,8 +28,7 @@ import (
     "k8s.io/client-go/tools/clientcmd"
     "k8s.io/client-go/util/retry"
     "k8s.io/apimachinery/pkg/api/errors"
-  utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	
+   
 
     "github.com/ChichiCaleb/runtimetest/apis/v1alpha1"
 )
@@ -74,7 +82,7 @@ func NewInClusterController(logger *zap.SugaredLogger) *Controller {
 	}
 
    // Check if ArgoCD is installed and ready
-	installed, ready, err := checkargo.IsArgoCDInstalledAndReady(logger, clientset)
+	installed, ready, err := isArgoCDInstalledAndReady(logger, clientset)
 	if err != nil {
 		logger.Fatalf("Error checking ArgoCD installation status: %v", err)
 	}
@@ -259,24 +267,6 @@ func scheduleTokenRefresh(c *Controller, password string) {
     }
 }
 
-// getApplicationStatus retrieves the status of the specified ArgoCD application
-func getApplicationStatus(client apiclient.Client, appName string) (*v1alpha1.AppStatus, error) {
-    appClient := client.NewApplicationClientOrDie()
-
-    app, err := appClient.Get(context.Background(), &application.ApplicationQuery{Name: &appName})
-    if err != nil {
-        return nil, fmt.Errorf("failed to get application: %v", err)
-    }
-
-    // Convert ArgoCD Application status to your custom AppStatus (v1alpha1.AppStatus)
-    appStatus := &v1alpha1.AppStatus{
-        SyncStatus:  app.Status.Sync.Status,
-        HealthStatus: app.Status.Health.Status,
-        // Populate other fields as necessary
-    }
-
-    return appStatus, nil
-}
 
 // UpdateStatus updates the status of the custom CRD using the provided dynamic client and logger
 func UpdateStatus(logger *zap.SugaredLogger, dynamicClient dynamic.Interface, observed *v1alpha1.App, status v1alpha1.AppStatus) error {
@@ -346,28 +336,26 @@ func updateStatus(logger *zap.SugaredLogger, dynamicClient dynamic.Interface, na
 
 
 func (c *Controller) RunController() {
+    // Authenticate and create ArgoCD client
+    password, err := getAdminPassword(c.Clientset)
+    if err != nil {
+        c.logger.Fatalf("Failed to get admin password: %v", err)
+    }
 
-	// Authenticate and create ArgoCD client
-	password, err := getAdminPassword(c.Clientset)
-	if err != nil {
-		c.logger.Fatalf("Failed to get admin password: %v", err)
-	}
+    authToken, err := GetAuthToken(c, password)
+    if err != nil {
+        c.logger.Fatalf("Failed to get auth token: %v", err)
+    }
 
-	authToken, err := GetAuthToken(c, password)
-	if err != nil {
-		c.logger.Fatalf("Failed to get auth token: %v", err)
-	}
+    err = refreshClients(c, authToken)
+    if err != nil {
+        c.logger.Fatalf("Failed to refresh clients: %v", err)
+    }
 
-	err = refreshClients(c, authToken)
-	if err != nil {
-		c.logger.Fatalf("Failed to refresh clients: %v", err)
-	}
-
-	c.logger.Info("Successfully created ArgoCD client")
-	c.logger.Infof("Successfully created ApplicationSet client")
-	c.logger.Infof("Successfully created Applicationclient")
-	c.logger.Info("App controller successfuly instantiated!!!")
-  
+    c.logger.Info("Successfully created ArgoCD client")
+    c.logger.Infof("Successfully created ApplicationSet client")
+    c.logger.Infof("Successfully created Application client")
+    c.logger.Info("App controller successfully instantiated!!!")
 
     // Create an ApplicationSet (example YAML definition)
     appSetYAML := `
@@ -400,19 +388,44 @@ spec:
           selfHeal: true
 `
 
-    // Apply the ApplicationSet
-    _, err = argoCDClient.NewApplicationSetClient().Create(context.Background(), &application.ApplicationSetCreateRequest{
-        ApplicationSet: []byte(appSetYAML),
+    c.logger.Info("Creating ApplicationSet in ArgoCD.")
+
+    var appSet appv1alpha1.ApplicationSet
+    err = yaml.Unmarshal([]byte(appSetYAML), &appSet)
+    if err != nil {
+        c.logger.Fatalf("Failed to unmarshal ApplicationSet YAML: %v", err)
+    }
+
+    err = retry.OnError(retry.DefaultRetry, errors.IsInternalError, func() error {
+        _, err = c.appSetClient.Create(context.Background(), &applicationsetpkg.ApplicationSetCreateRequest{
+            Applicationset: &appSet,
+        })
+        return err
     })
+
     if err != nil {
         c.logger.Fatalf("Failed to create ApplicationSet: %v", err)
     }
-    c.logger.Infof("ApplicationSet created successfully")
 
-    // Retrieve the application status
-    appStatus, err := getApplicationStatus(argoCDClient, "example-app")
+    c.logger.Infof("Successfully applied ApplicationSet '%s' using ArgoCD", appSet.Name)
+
+    // Wait for a short period to allow the ApplicationSet to be processed
+    time.Sleep(15 * time.Second)
+
+    name := "my-cluster-app"
+    argocdNamespace := "argocd"
+
+    app, err := c.appClient.Get(context.Background(), &applicationpkg.ApplicationQuery{
+        Name:         &name,
+        AppNamespace: &argocdNamespace,
+    })
     if err != nil {
-        c.logger.Fatalf("Failed to retrieve application status: %v", err)
+        c.logger.Fatalf("Failed to get application: %v", err)
+    }
+
+    // Populate the AppStatus structure
+    appStatus := v1alpha1.AppStatus{  // Use the correct reference to AppStatus
+        HealthStatus: app.Status,
     }
 
     // Update the status using the UpdateStatus function
@@ -421,12 +434,54 @@ spec:
             Name:      "example-app",
             Namespace: "default",
         },
+        Status: appStatus, // Assign the populated AppStatus
     }
-    err = UpdateStatus(c.logger, dynamicClient, observed, *appStatus)
+
+    err = UpdateStatus(c.logger, c.dynClient, observed, appStatus)
     if err != nil {
         c.logger.Fatalf("Failed to update status: %v", err)
     }
 
     c.logger.Infof("Status updated successfully")
+}
 
+
+
+
+func isArgoCDInstalledAndReady(logger *zap.SugaredLogger, clientset kubernetes.Interface) (bool, bool, error) {
+	_, err := clientset.CoreV1().Namespaces().Get(context.TODO(), "argocd", metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+
+	// Check for the presence and readiness of ArgoCD components
+	deployments := []string{
+		"argo-cd-argocd-applicationset-controller",
+		"argo-cd-argocd-notifications-controller",
+		"argo-cd-argocd-server",
+		"argo-cd-argocd-repo-server",
+		"argo-cd-argocd-redis",
+		"argo-cd-argocd-dex-server",
+	}
+
+	for _, deployment := range deployments {
+		deploy, err := clientset.AppsV1().Deployments("argocd").Get(context.TODO(), deployment, metav1.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				logger.Info("ArgoCD Components not found. Installing...")
+				return false, false, nil
+			}
+			return false, false, err
+		}
+
+		// Check if the number of ready replicas matches the desired replicas
+		if deploy.Status.ReadyReplicas != *deploy.Spec.Replicas {
+			return true, false, nil // Components are installed but not ready
+		}
+	}
+
+	return true, true, nil // All components are installed and ready
 }
