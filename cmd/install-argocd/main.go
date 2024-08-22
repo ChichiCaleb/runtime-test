@@ -86,7 +86,7 @@ func main() {
 	}
 
 	 // Set up port forwarding to access ArgoCD server locally
-	 err = setupPortForwardingToService(clientset, "argocd", "argo-cd-argocd-server", 8080, 80)
+	 err = setupPortForwardingToService(clientset, "argocd", "argo-cd-argocd-server", 8080, 8080)
 	 if err != nil {
 		 sugar.Fatalf("Failed to set up port forwarding: %v", err)
 	 }

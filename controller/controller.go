@@ -28,7 +28,7 @@ import (
     "k8s.io/client-go/tools/clientcmd"
     "k8s.io/client-go/util/retry"
     "k8s.io/apimachinery/pkg/api/errors"
-   
+    "k8s.io/client-go/util/homedir"
 
     "github.com/ChichiCaleb/runtimetest/apis/v1alpha1"
 )
@@ -64,12 +64,7 @@ func NewController(clientset kubernetes.Interface, dynClient dynamic.Interface, 
 // NewInClusterController initializes a new controller for in-cluster execution
 func NewInClusterController(logger *zap.SugaredLogger) *Controller {
 
-    // Expand the tilde manually
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		logger.Fatalf("Error finding home directory: %v", err)
-	}
-	kubeconfigPath := filepath.Join(homeDir, ".kube", "config")
+    kubeconfigPath := filepath.Join(homedir.HomeDir(), ".kube", "config")
 
 	// Load kubeconfig and create clientset
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
