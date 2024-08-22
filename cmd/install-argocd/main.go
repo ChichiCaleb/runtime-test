@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 	"path/filepath"
+	
    
 
 	appv1alpha1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
@@ -32,6 +33,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+   "k8s.io/client-go/transport/spdy"
+    "k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/util/homedir"
+    "k8s.io/client-go/tools/portforward"
+
+ 
+	
 	
 	"sigs.k8s.io/yaml"
 	"golang.org/x/crypto/ssh"
@@ -52,12 +60,8 @@ func main() {
 		version = "6.6.0"
 	}
 
-	 // Expand the tilde manually
-	 homeDir, err := os.UserHomeDir()
-	 if err != nil {
-		 sugar.Fatalf("Error finding home directory: %v", err)
-	 }
-	 kubeconfigPath := filepath.Join(homeDir, ".kube", "config")
+
+	 kubeconfigPath := filepath.Join(homedir.HomeDir(), ".kube", "config")
  
 	 // Load kubeconfig and create clientset
 	 config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
@@ -81,6 +85,12 @@ func main() {
 		sugar.Fatalf("Failed to install ArgoCD: %v", err)
 	}
 
+	 // Set up port forwarding to access ArgoCD server locally
+	 err = setupPortForwardingToService(clientset, "argocd", "argo-cd-argocd-server", 8080, 80)
+	 if err != nil {
+		 sugar.Fatalf("Failed to set up port forwarding: %v", err)
+	 }
+
 	// Retrieve ArgoCD admin password
 	adminPassword, err := getArgoCDAdminPassword(clientset)
 	if err != nil {
@@ -95,7 +105,7 @@ func main() {
 
 	// Set up ArgoCD client with the token
 	argoClient, err := argocdclient.NewClient(&argocdclient.ClientOptions{
-		ServerAddr:  "argo-cd-argocd-server.argocd.svc.cluster.local",
+		ServerAddr:  "http://localhost:8080", // Point to localhost due to port forwarding
 	    AuthToken:   token,
 	    PlainText:   true,
 	})
@@ -372,7 +382,7 @@ func getArgoCDAdminPassword(clientset kubernetes.Interface) (string, error) {
 }
 
 func getArgoCDToken(username, password string) (string, error) {
-	argoURL := "http://argo-cd-argocd-server.argocd.svc.cluster.local/api/v1/session"
+	argoURL := "http://localhost:8080/api/v1/session"
     payload := map[string]string{
         "username": username,
         "password": password,
@@ -501,4 +511,78 @@ func namespaceExists(namespace string, clientset kubernetes.Interface) (bool, er
 		return false, err
 	}
 	return true, nil
+}
+
+
+func setupPortForwardingToService(clientset kubernetes.Interface, namespace, serviceName string, localPort, remotePort int) error {
+	// Define the ports to forward
+	ports := []string{fmt.Sprintf("%d:%d", localPort, remotePort)}
+
+	// Get the service
+	svc, err := clientset.CoreV1().Services(namespace).Get(context.TODO(), serviceName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get service: %w", err)
+	}
+
+	// Find a pod that matches the service selector
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods: %w", err)
+	}
+	if len(pods.Items) == 0 {
+		return fmt.Errorf("no matching pods found for service %s in namespace %s", serviceName, namespace)
+	}
+
+	pod := pods.Items[0] // Choose the first matching pod
+
+	// Prepare port forwarding
+	stopChannel := make(chan struct{}, 1)
+	readyChannel := make(chan struct{})
+
+	// Load kubeconfig
+	kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to get client config: %w", err)
+	}
+
+	// Create the URL for port forwarding
+	req := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(namespace).
+		Name(pod.Name).
+		SubResource("portforward")
+
+	// Use SPDY to create the dialer
+	transport, upgrader, err := spdy.RoundTripperFor(config)
+	if err != nil {
+		return fmt.Errorf("failed to create round tripper: %w", err)
+	}
+
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
+
+	// Create the port forwarder
+	pf, err := portforward.New(dialer, ports, stopChannel, readyChannel, os.Stdout, os.Stderr)
+	if err != nil {
+		return fmt.Errorf("failed to create port forwarder: %w", err)
+	}
+
+	// Start port forwarding in a new goroutine
+	go func() {
+		if err := pf.ForwardPorts(); err != nil {
+			fmt.Printf("Port forwarding error: %v\n", err)
+		}
+	}()
+
+	// Wait until the port forwarding is ready
+	select {
+	case <-readyChannel:
+		fmt.Println("Port forwarding is ready")
+	case <-time.After(15 * time.Second):
+		return fmt.Errorf("timeout waiting for port forwarding to be ready")
+	}
+
+	return nil
 }
