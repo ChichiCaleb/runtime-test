@@ -86,7 +86,7 @@ func main() {
 	}
 
 	 // Set up port forwarding to access ArgoCD server locally
-	 err = setupPortForwardingToService(clientset, "argocd", "argo-cd-argocd-server", 80, 8080)
+	 err = setupPortForwardingToService(clientset, "argocd", "argo-cd-argocd-server", 8080, 8080)
 	 if err != nil {
 		 sugar.Fatalf("Failed to set up port forwarding: %v", err)
 	 }
@@ -105,7 +105,7 @@ func main() {
 
 	// Set up ArgoCD client with the token
 	argoClient, err := argocdclient.NewClient(&argocdclient.ClientOptions{
-		ServerAddr:  "http://localhost", // Point to localhost due to port forwarding
+		ServerAddr:  "http://localhost:8080", // Point to localhost due to port forwarding
 	    AuthToken:   token,
 	    PlainText:   true,
 	})
