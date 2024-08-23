@@ -5,13 +5,14 @@ import (
     "fmt"
     "path/filepath"
     "sync"            
-    "os"              
+    "os"      
     "encoding/json"   
     "net/http"        
     "time"            
     "bytes"          
     "io" 
-    "gopkg.in/yaml.v2"             
+    "gopkg.in/yaml.v2"  
+    "crypto/tls"           
 
     apiclient "github.com/argoproj/argo-cd/v2/pkg/apiclient"
     applicationsetpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/applicationset"
@@ -29,8 +30,12 @@ import (
     "k8s.io/client-go/util/retry"
     "k8s.io/apimachinery/pkg/api/errors"
     "k8s.io/client-go/util/homedir"
+    "k8s.io/client-go/transport/spdy"
+    "k8s.io/apimachinery/pkg/labels"
+    "k8s.io/client-go/tools/portforward"
 
     "github.com/ChichiCaleb/runtimetest/apis/v1alpha1"
+    
 )
 
 var (
@@ -101,13 +106,13 @@ func NewInClusterController(logger *zap.SugaredLogger) *Controller {
 // CreateArgoCDClient creates and returns an Argo CD client
 func CreateArgoCDClient(authToken string) (apiclient.Client, error) {
    
-    argoURL := "argo-cd-argocd-server.argocd.svc.cluster.local"
+    argoURL := "https://localhost:8080"
 
     // Create Argo CD client options with the token
     argoClientOpts := apiclient.ClientOptions{
         ServerAddr: argoURL,
         AuthToken:  authToken,
-		PlainText: true,
+		PlainText: false,
     }
 
     // Create the Argo CD client
@@ -176,48 +181,48 @@ func getAdminPassword(clientset kubernetes.Interface) (string, error) {
 }
 
 func GenerateAuthToken(password string) (string, error) {
-    argoURL := "http://argo-cd-argocd-server.argocd.svc.cluster.local/api/v1/session"
-    payload := map[string]string{
-        "username": "admin",
-        "password": password,
-    }
-    payloadBytes, _ := json.Marshal(payload)
+    argoURL := "https://localhost:8080/api/v1/session"
+	payload := map[string]string{
+		"username": "admin",
+		"password": password,
+	}
+	payloadBytes, _ := json.Marshal(payload)
 
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Disable TLS verification
+		},
+	}
 
-    client := &http.Client{
-        Timeout: 30 * time.Second,
-    }
+	req, err := http.NewRequest("POST", argoURL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-    req, err := http.NewRequest("POST", argoURL, bytes.NewBuffer(payloadBytes))
-    if err != nil {
-        return "", fmt.Errorf("failed to create request: %v", err)
-    }
-    req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
 
-    resp, err := client.Do(req)
-    if err != nil {
-        return "", fmt.Errorf("failed to send request: %v", err)
-    }
-    defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("authentication failed: %v, response: %s", resp.Status, string(bodyBytes))
+	}
 
-    if resp.StatusCode != http.StatusOK {
-        bodyBytes, _ := io.ReadAll(resp.Body)
-      return "", fmt.Errorf("authentication failed: %v, response: %s", resp.Status, string(bodyBytes))
-    }
+	var response map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("failed to decode response: %v", err)
+	}
 
-    var response map[string]interface{}
-    if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-        return "", fmt.Errorf("failed to decode response: %v", err)
-    }
+	token, ok := response["token"].(string)
+	if !ok {
+		return "", fmt.Errorf("token not found in response")
+	}
 
-    token, ok := response["token"].(string)
-    if !ok {
-       
-      return "", fmt.Errorf("token not found in response")
-    }
-
-
-    return token, nil
+	return token, nil
 }
 
 // GetAuthToken retrieves the current token, generating a new one if necessary
@@ -331,6 +336,13 @@ func updateStatus(logger *zap.SugaredLogger, dynamicClient dynamic.Interface, na
 
 
 func (c *Controller) RunController() {
+
+     // Set up port forwarding to access ArgoCD server locally
+	 err := setupPortForwardingToService(c.Clientset, "argocd", "argo-cd-argocd-server", 8080, 8080)
+	 if err != nil {
+        c.logger.Fatalf("Failed to set up port forwarding: %v", err)
+	 }
+
     // Authenticate and create ArgoCD client
     password, err := getAdminPassword(c.Clientset)
     if err != nil {
@@ -479,4 +491,77 @@ func isArgoCDInstalledAndReady(logger *zap.SugaredLogger, clientset kubernetes.I
 	}
 
 	return true, true, nil // All components are installed and ready
+}
+
+func setupPortForwardingToService(clientset kubernetes.Interface, namespace, serviceName string, localPort, remotePort int) error {
+	// Define the ports to forward
+	ports := []string{fmt.Sprintf("%d:%d", localPort, remotePort)}
+
+	// Get the service
+	svc, err := clientset.CoreV1().Services(namespace).Get(context.TODO(), serviceName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get service: %w", err)
+	}
+
+	// Find a pod that matches the service selector
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods: %w", err)
+	}
+	if len(pods.Items) == 0 {
+		return fmt.Errorf("no matching pods found for service %s in namespace %s", serviceName, namespace)
+	}
+
+	pod := pods.Items[0] // Choose the first matching pod
+
+	// Prepare port forwarding
+	stopChannel := make(chan struct{}, 1)
+	readyChannel := make(chan struct{})
+
+	// Load kubeconfig
+	kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to get client config: %w", err)
+	}
+
+	// Create the URL for port forwarding
+	req := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(namespace).
+		Name(pod.Name).
+		SubResource("portforward")
+
+	// Use SPDY to create the dialer
+	transport, upgrader, err := spdy.RoundTripperFor(config)
+	if err != nil {
+		return fmt.Errorf("failed to create round tripper: %w", err)
+	}
+
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", req.URL())
+
+	// Create the port forwarder
+	pf, err := portforward.New(dialer, ports, stopChannel, readyChannel, os.Stdout, os.Stderr)
+	if err != nil {
+		return fmt.Errorf("failed to create port forwarder: %w", err)
+	}
+
+	// Start port forwarding in a new goroutine
+	go func() {
+		if err := pf.ForwardPorts(); err != nil {
+			fmt.Printf("Port forwarding error: %v\n", err)
+		}
+	}()
+
+	// Wait until the port forwarding is ready
+	select {
+	case <-readyChannel:
+		fmt.Println("Port forwarding is ready")
+	case <-time.After(15 * time.Second):
+		return fmt.Errorf("timeout waiting for port forwarding to be ready")
+	}
+
+	return nil
 }
