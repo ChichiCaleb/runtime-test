@@ -107,7 +107,7 @@ func main() {
 	argoClient, err := argocdclient.NewClient(&argocdclient.ClientOptions{
 		ServerAddr:  "http://localhost:8080", // Point to localhost due to port forwarding
 	    AuthToken:   token,
-	    PlainText:   true,
+	    PlainText:   false,
 	})
 	if err != nil {
 		sugar.Fatalf("Failed to create ArgoCD client: %v", err)
