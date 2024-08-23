@@ -105,12 +105,9 @@ func NewInClusterController(logger *zap.SugaredLogger) *Controller {
 
 // CreateArgoCDClient creates and returns an Argo CD client
 func CreateArgoCDClient(authToken string) (apiclient.Client, error) {
-   
-    argoURL := "https://localhost:8080"
-
     // Create Argo CD client options with the token
     argoClientOpts := apiclient.ClientOptions{
-        ServerAddr: argoURL,
+        ServerAddr: "https://localhost:8080",
         AuthToken:  authToken,
 		PlainText: false,
     }
