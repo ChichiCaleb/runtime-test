@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 	"path/filepath"
-	
+	"crypto/tls"
    
 
 	appv1alpha1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
@@ -105,7 +105,7 @@ func main() {
 
 	// Set up ArgoCD client with the token
 	argoClient, err := argocdclient.NewClient(&argocdclient.ClientOptions{
-		ServerAddr:  "http://localhost:8080", // Point to localhost due to port forwarding
+		ServerAddr:  "https://localhost:8080", // Point to localhost due to port forwarding
 	    AuthToken:   token,
 	    PlainText:   false,
 	})
@@ -382,48 +382,48 @@ func getArgoCDAdminPassword(clientset kubernetes.Interface) (string, error) {
 }
 
 func getArgoCDToken(username, password string) (string, error) {
-	argoURL := "http://localhost:8080/api/v1/session"
-    payload := map[string]string{
-        "username": username,
-        "password": password,
-    }
-    payloadBytes, _ := json.Marshal(payload)
+	argoURL := "https://localhost:8080/api/v1/session"
+	payload := map[string]string{
+		"username": username,
+		"password": password,
+	}
+	payloadBytes, _ := json.Marshal(payload)
 
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Disable TLS verification
+		},
+	}
 
-    client := &http.Client{
-        Timeout: 30 * time.Second,
-    }
+	req, err := http.NewRequest("POST", argoURL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-    req, err := http.NewRequest("POST", argoURL, bytes.NewBuffer(payloadBytes))
-    if err != nil {
-        return "", fmt.Errorf("failed to create request: %v", err)
-    }
-    req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
 
-    resp, err := client.Do(req)
-    if err != nil {
-        return "", fmt.Errorf("failed to send request: %v", err)
-    }
-    defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("authentication failed: %v, response: %s", resp.Status, string(bodyBytes))
+	}
 
-    if resp.StatusCode != http.StatusOK {
-        bodyBytes, _ := io.ReadAll(resp.Body)
-      return "", fmt.Errorf("authentication failed: %v, response: %s", resp.Status, string(bodyBytes))
-    }
+	var response map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("failed to decode response: %v", err)
+	}
 
-    var response map[string]interface{}
-    if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-        return "", fmt.Errorf("failed to decode response: %v", err)
-    }
+	token, ok := response["token"].(string)
+	if !ok {
+		return "", fmt.Errorf("token not found in response")
+	}
 
-    token, ok := response["token"].(string)
-    if !ok {
-       
-      return "", fmt.Errorf("token not found in response")
-    }
-
-
-    return token, nil
+	return token, nil
 }
 
 func storeSSHKeyFromEnv(argoClient argocdclient.Client, logger *zap.SugaredLogger) error {
